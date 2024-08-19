@@ -1,64 +1,266 @@
 from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+import datetime
+from datetime import timezone
 from ultralytics import YOLO
 import cv2
 import numpy as np
+import base64
 
 app = Flask(__name__)
 CORS(app)
 
+app.config['SECRET_KEY'] = 'projectsecret'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mariadb+mariadbconnector://han:0000@ec2-3-38-242-92.ap-northeast-2.compute.amazonaws.com:3306/ex1'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+
+class User(db.Model):
+    __tablename__ = 'user'
+    id = db.Column(db.String(20), primary_key=True, nullable=False)
+    name = db.Column(db.String(20), nullable=False)
+    password = db.Column(db.String(255), nullable=False)
+    clause_service = db.Column(db.String(1), nullable=False)
+    clause_personal = db.Column(db.String(1), nullable=False)
+    result = db.relationship('Result', cascade='all, delete-orphan', overlaps="results")
+
+class Result(db.Model):
+    __tablename__ = 'result'
+    id = db.Column(db.BigInteger, primary_key=True, nullable=False, autoincrement=True)
+    pic1 = db.Column(db.LargeBinary, nullable=True)
+    pic2 = db.Column(db.LargeBinary, nullable=True)
+    user_id = db.Column(db.String(20), db.ForeignKey('user.id', ondelete='cascade'), nullable=False)
+    user = db.relationship('User', backref=db.backref('results', lazy=True), overlaps="result")
+
 # YOLOv8 모델 로드
-model = YOLO("models/yolov8n_best.pt")
+model = YOLO("/Users/joyongju/flask-/models/best.pt")
+
+fish_class = {
+    0: 'Flatfish : 넙치',
+    1: 'Salmon : 연어',
+    2: 'Sea bream : 도미',
+    3: 'Amberjack : 방어',
+    4: 'Tuna : 참치',
+    5: 'Gizzard Shad : 전어',
+    6: 'Abalone : 전복',
+    7: 'Bass : 농어',
+    8: 'Croaker : 민어',
+    9: 'Cutlassfish : 갈치',
+    10: 'Mackerel : 고등어',
+    11: 'Octopus : 문어',
+    12: 'Rockfish : 볼락'
+}
 
 def preprocess_image(contents):
-    # 바이트 스트림을 numpy 배열로 변환
     nparr = np.frombuffer(contents, np.uint8)
-    # OpenCV를 사용하여 이미지를 디코딩
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     return img
 
-def postprocess_results(results):
-    # YOLO 모델의 예측 결과에서 필요한 정보 추출
-    labels = []
-    boxes = []
-    confidences = []
-
-    for result in results.boxes:
-        xyxy = result.xyxy.numpy().astype(int).tolist()[0]  # 바운딩 박스 좌표
-        confidence = result.conf.numpy().tolist()[0]  # 신뢰도
-        label = result.cls.numpy().tolist()[0]  # 클래스 라벨
-
-        boxes.append(xyxy)
-        confidences.append(confidence)
-        labels.append(label)
-
-    return {"labels": labels, "boxes": boxes, "confidences": confidences}
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
+@app.route('/take_pic', methods=['POST'])
+def take_pic():
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+    if not file:
+        return jsonify({"message": "no img. retry"})
 
-    contents = file.read()
-    img = preprocess_image(contents)
+    get_token = request.headers.get('Authorization')
+    if not get_token:
+        return jsonify({"message": "no token"})
 
-    # 디버깅: 전처리된 이미지 출력
-    print("Preprocessed image shape:", img.shape)
+    token = get_token.split(" ")[1]
+    payload = check_token(token)
+    if not payload:
+        return jsonify({"message": "Token: invalid or expired"})
+    payload_id = payload['user_id']
+    user = User.query.filter_by(id=payload_id).first()
+    user_in = user.id
 
-    results = model(img)[0]  # 첫 번째 결과 가져오기
+    original_byte = file.read()
+    img = preprocess_image(original_byte)
 
-    # 디버깅: 모델 결과 출력
-    print("Model raw results:", results)
+    # YOLO 예측 수행
+    results = model(img)[0]
 
-    processed_results = postprocess_results(results)
+    # 예측 결과 이미지 생성 및 인코딩
+    result_np = results.plot()
+    _, buffer = cv2.imencode('.jpg', result_np)
+    result_byte = buffer.tobytes()
+    send = base64.b64encode(buffer).decode('utf-8')
 
-    # 디버깅: 후처리된 결과 출력
-    print("Processed results:", processed_results)
+    # 예측된 물고기 이름 리스트 생성
+    cls = results.boxes.cls.numpy().tolist()
+    box_int = list(set(int(value) for value in cls))
+    box_name = [fish_class[i] for i in box_int if i in fish_class]
 
-    return jsonify(processed_results)
+    # 결과를 DB에 저장
+    new_result = Result(user_id=user_in, pic1=original_byte, pic2=result_byte)
+    db.session.add(new_result)
+    db.session.commit()
+
+    return jsonify({'image': send, "list": box_name})
+
+# 회원가입 시 약관 동의 체크
+@app.route('/join/check', methods=['POST'])
+def clause():
+    data = request.json
+    input_cl1 = data.get('input_cl1')
+    input_cl2 = data.get('input_cl2')
+
+    if input_cl1 == 'y' and input_cl2 == 'y':
+        return jsonify({"message": "next"}), 200
+    else:
+        return jsonify({"message": "필수동의 체크해주세요."}), 400
+
+# 회원가입
+@app.route('/join/information', methods=['POST'])
+def information():
+    data = request.json
+    input_id = data.get('input_id')
+    input_name = data.get('input_name')
+    input_pw = data.get('input_password')
+    input_pw_check = data.get('input_password_check')
+
+    if not input_name or not input_id or not input_pw or not input_pw_check:
+        return jsonify({"message": "input all"}), 400
+    else:
+        DB_id = User.query.filter_by(id=input_id).first()
+        if DB_id:
+            return jsonify({"message": "이미 있는 아이디 입니다."}), 409
+        elif input_pw != input_pw_check:
+            return jsonify({"message": "비밀번호를 확인해 주세요."}), 400
+        else:
+            try:
+                hashed_password = generate_password_hash(input_pw, method='sha256')
+                new_user = User(id=input_id, name=input_name, password=hashed_password, clause_service='Y', clause_personal='Y')
+                db.session.add(new_user)
+                db.session.commit()
+                return jsonify({"message": "success"}), 201
+            except Exception as e:
+                db.session.rollback()
+                return jsonify({"message": "error", "details": str(e)}), 500
+
+# 로그인 시도
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    input_id = data.get('input_id')
+    input_pw = data.get('input_password')
+
+    DB_id = User.query.filter_by(id=input_id).first()
+
+    if DB_id:
+        if check_password_hash(DB_id.password, input_pw):
+            access_token, refresh_token = create_token(DB_id.id)
+            return jsonify({
+                "message": "login success",
+                "access_token": access_token,
+                "refresh_token": refresh_token
+            })
+        else:
+            return jsonify({"message": "password is different"})
+    else:
+        return jsonify({"message": "no account"})
+
+# user id 이용해서 access token, refresh token 발급
+def create_token(userID):
+    access_token = jwt.encode({
+        'user_id' : userID,
+        'exp' : datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+    }, app.config['SECRET_KEY'], algorithm='HS256')
+
+    refresh_token = jwt.encode({
+        'user_id' : userID,
+        'exp' : datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=60)
+    }, app.config['SECRET_KEY'], algorithm='HS256')
+
+    return access_token, refresh_token
+
+# access 토큰 만료 시 r token 사용해 접근 / a,r token 새로 생성
+@app.route('/token/refresh', methods=['POST'])
+def refresh_token():
+    data = request.json
+    refresh_token = data.get('refresh_token')
+
+    try:
+        decoded_token = jwt.decode(refresh_token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        userID = decoded_token['user_id']
+
+        access_token, new_refresh_token = create_token(userID)
+
+        return jsonify({"access_token": access_token, "refresh_token": new_refresh_token})
+
+    except jwt.ExpiredSignatureError:
+        return jsonify({"message": "Refresh token expired"})
+    except jwt.InvalidTokenError:
+        return jsonify({"message": "Invalid token"})
+
+# 요구 시 토큰 검증
+def token_require(f):
+    def decorated_func(*args, **kwargs):
+        get_token = request.headers.get('Authorization')
+        if get_token:
+            token = get_token.split(" ")[1]
+            payload = check_token(token)
+            if not payload:
+                return jsonify({"message": "token is invalid or expired"})
+        else:
+            return jsonify({"message": "token is no exist"})
+
+        return f(*args, **kwargs)
+    return decorated_func
+
+def check_token(token):
+    try:
+        payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        exp_time = datetime.datetime.fromtimestamp(payload['exp'], tz=timezone.utc)
+        if exp_time < datetime.datetime.now(timezone.utc):
+            return None
+        return payload
+    except jwt.InvalidTokenError:
+        return None
+
+@app.route('/protected', methods=['GET'])
+@token_require
+def protected():
+    return jsonify({"message": "This is a protected route"})
+
+# 회원 탈퇴 기능
+@app.route('/unregister', methods=['POST'])
+def unregister():
+    get_token = request.headers.get('Authorization')
+    if not get_token:
+        return jsonify({"message": "no token"})
+
+    token = get_token.split(" ")[1]
+    payload = check_token(token)
+    if not payload:
+        return jsonify({"message": "Token: invalid or expired"})
+
+    payload_id = payload['user_id']
+    user = User.query.filter_by(id=payload_id).first()
+
+    data = request.json
+    input_pw = data.get('input_pw')
+    input_pw_re = data.get('input_pw_re')
+
+    if not input_pw or not input_pw_re:
+        return jsonify({"message": "input all"})
+    if input_pw != input_pw_re:
+        return jsonify({"message": "enter the same password"})
+
+    try:
+        if check_password_hash(user.password, input_pw):  # 해시된 비밀번호 비교
+            db.session.delete(user)
+            db.session.commit()
+            return jsonify({"message": "delete success"})
+        else:
+            return jsonify({"message": "incorrect password"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "error", "details": str(e)})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
