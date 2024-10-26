@@ -9,6 +9,7 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 import base64
+import os  # 추가된 부분
 
 app = Flask(__name__)
 CORS(app)
@@ -37,22 +38,22 @@ class Result(db.Model):
     user = db.relationship('User', backref=db.backref('results', lazy=True), overlaps="result")
 
 # YOLOv8 모델 로드
-model = YOLO("/Users/joyongju/flask-/models/best.pt")
+model = YOLO("/Users/joyongju/flask-/models/conv_parameter.pt")
 
 fish_class = {
-    0: 'Flatfish : 넙치',
-    1: 'Salmon : 연어',
-    2: 'Sea bream : 도미',
-    3: 'Amberjack : 방어',
-    4: 'Tuna : 참치',
-    5: 'Gizzard Shad : 전어',
-    6: 'Abalone : 전복',
-    7: 'Bass : 농어',
-    8: 'Croaker : 민어',
-    9: 'Cutlassfish : 갈치',
-    10: 'Mackerel : 고등어',
-    11: 'Octopus : 문어',
-    12: 'Rockfish : 볼락'
+    0: '넙치',
+    1: '연어',
+    2: '도미',
+    3: '방어',
+    4: '참치',
+    5: '전어',
+    6: '전복',
+    7: '농어',
+    8: '민어',
+    9: '갈치',
+    10: '고등어',
+    11: '문어',
+    12: '볼락'
 }
 
 def preprocess_image(contents):
@@ -93,7 +94,7 @@ def take_pic():
     # 예측된 물고기 이름 리스트 생성
     cls = results.boxes.cls.numpy().tolist()
     box_int = list(set(int(value) for value in cls))
-    box_name = [fish_class[i] for i in box_int if i in fish_class]
+    box_name = [fish_class[i] for i in fish_class if i in box_int]
 
     # 결과를 DB에 저장
     new_result = Result(user_id=user_in, pic1=original_byte, pic2=result_byte)
@@ -101,6 +102,67 @@ def take_pic():
     db.session.commit()
 
     return jsonify({'image': send, "list": box_name})
+
+# 결과 조회
+@app.route('/get_result', methods=['POST'])
+def get_result():
+    get_token = request.headers.get('Authorization')
+    if not get_token:
+        return jsonify({"message": "no token"})
+
+    token = get_token.split(" ")[1]
+    payload = check_token(token)
+    if not payload:
+        return jsonify({"message": "Token : invalid or expired"})
+    payload_id = payload['user_id']
+    user = User.query.filter_by(id=payload_id).first()
+    user_in = user.id
+
+    user_results = Result.query.filter_by(user_id=user_in).all()
+
+    if not user_results:
+        return jsonify({'message': 'no result'})
+
+    pics = []
+    for result in user_results:
+        if result.pic2:
+            buffer = np.frombuffer(result.pic2, dtype=np.ubyte)
+            pic = base64.b64encode(buffer).decode('utf-8')
+            pics.append(pic)
+
+    return jsonify(pics)
+
+# 이미지 삭제 기능 추가
+@app.route('/delete_images', methods=['POST'])
+def delete_images():
+    data = request.json
+    indices = data.get('indices')
+
+    if not indices:
+        return jsonify({'error': 'No images specified'}), 400
+
+    get_token = request.headers.get('Authorization')
+    if not get_token:
+        return jsonify({"message": "no token"})
+
+    token = get_token.split(" ")[1]
+    payload = check_token(token)
+    if not payload:
+        return jsonify({"message": "Token: invalid or expired"})
+    payload_id = payload['user_id']
+
+    try:
+        for index in indices:
+            # 인덱스에 해당하는 이미지 레코드를 가져오기
+            result = Result.query.filter_by(user_id=payload_id).offset(index).first()
+            if result:
+                db.session.delete(result)  # 레코드 삭제
+                # 여기서 파일 시스템에서 실제 이미지 파일을 삭제하는 로직 추가 가능
+        db.session.commit()
+        return jsonify({'message': 'Images deleted successfully'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
 
 # 회원가입 시 약관 동의 체크
 @app.route('/join/check', methods=['POST'])
@@ -167,13 +229,13 @@ def login():
 # user id 이용해서 access token, refresh token 발급
 def create_token(userID):
     access_token = jwt.encode({
-        'user_id' : userID,
-        'exp' : datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+        'user_id': userID,
+        'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
     }, app.config['SECRET_KEY'], algorithm='HS256')
 
     refresh_token = jwt.encode({
-        'user_id' : userID,
-        'exp' : datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=60)
+        'user_id': userID,
+        'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=60)
     }, app.config['SECRET_KEY'], algorithm='HS256')
 
     return access_token, refresh_token
